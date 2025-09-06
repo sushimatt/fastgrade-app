@@ -4,7 +4,6 @@ import mammoth from "mammoth";
 import { GlobalWorkerOptions, getDocument } from "pdfjs-dist";
 import "./App.css";
 
-// use an explicit https URL for pdf.js worker
 GlobalWorkerOptions.workerSrc =
   "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.worker.min.mjs";
 
@@ -49,13 +48,6 @@ const readPdfFile = (file) =>
     reader.readAsArrayBuffer(file);
   });
 
-const fileToBase64 = (file) =>
-  new Promise((resolve) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.readAsDataURL(file);
-  });
-
 // -------------------- App --------------------
 export default function App() {
   const [apiKey, setApiKey] = useState("");
@@ -75,7 +67,6 @@ export default function App() {
     if (newKey.trim()) localStorage.setItem("openai_api_key", newKey.trim());
   };
 
-  // -------------------- Student helpers --------------------
   const updateStudent = (index, updates) => {
     setStudents((prev) => {
       const updated = [...prev];
@@ -173,11 +164,19 @@ export default function App() {
             {
               role: "system",
               content:
-                "You are a grading assistant. Compare student answers to the key and provide structured results.",
+                "You are a grading assistant. Compare student answers to the key and provide structured results. Don't get creative but do compare the answer from the key to the student's answer carefully and contextually, even if the wording is different - assign complete credit if answer answers the question conceptually, don't deduct points for spelling or if worded different. For each question, assign a closeness score (0-100) and a verdict (Correct, Partial, Incorrect) based on the closeness. The Question score should be the total score of the test divided by the number of the question except if the question itself states the points it is worth. For extracting the name, use the filename, first line of the submission or anything that has Name, Person or Student indication and chose the one that is most likely a name.",
             },
             {
               role: "user",
-              content: `Key:\n${answerKey}\n\nStudent (${student.name}):\n${student.content}\n\nReturn JSON with:\n{"total_score": number, "scores": {"q1": number, ...}, "feedback": string}`,
+              content: `Key:\n${answerKey}\n\nStudent (${student.name}):\n${student.content}\n\nReturn JSON with structure:
+{
+  "total_score": number,
+  "questions": [
+    {"id": "q1", "question": string, "student_answer": string, "correct_answer": string, "closeness": number, "verdict": "Correct|Partial|Incorrect", "questionscore": number}
+  ],
+  "feedback": string
+}
+Only return valid JSON.`,
             },
           ],
           temperature: 0,
@@ -186,18 +185,18 @@ export default function App() {
 
       updateStudent(index, { status: "received" });
       const data = await response.json();
-      const text = data?.choices?.[0]?.message?.content ?? "";
+      let text = data?.choices?.[0]?.message?.content ?? "";
       console.log("📥 Raw GPT response:", text);
+
+      // strip markdown fences
+      let cleaned = text.trim();
+      if (cleaned.startsWith("```")) {
+        cleaned = cleaned.replace(/^```[a-zA-Z]*\n?/, "");
+        cleaned = cleaned.replace(/```$/, "");
+      }
 
       let parsed;
       try {
-        // clean GPT response of code fences/backticks
-        let cleaned = text.trim();
-        if (cleaned.startsWith("```")) {
-          cleaned = cleaned.replace(/^```[a-zA-Z]*\n?/, ""); // remove opening ```json or ```
-          cleaned = cleaned.replace(/```$/, ""); // remove closing ```
-        }
-
         parsed = JSON.parse(cleaned);
       } catch (err) {
         console.error("❌ Parse error:", err, "Raw:", text);
@@ -234,21 +233,44 @@ export default function App() {
   // -------------------- Export CSV --------------------
   const exportCSV = () => {
     if (students.length === 0) return;
-    const qKeysSet = new Set();
-    students.forEach((s) => {
-      const scores = s?.result?.scores;
-      if (scores) Object.keys(scores).forEach((k) => qKeysSet.add(k));
-    });
-    const questionKeys = Array.from(qKeysSet).sort();
 
-    const headers = ["Name", "Total Score", ...questionKeys, "Feedback", "Graded At"];
+    // Collect all question ids across all students
+    const qIds = new Set();
+    students.forEach((s) => {
+      s?.result?.questions?.forEach((q) => qIds.add(q.id));
+    });
+    const questionIds = Array.from(qIds);
+
+    const headers = [
+      "Name",
+      "Total Score",
+      ...questionIds.flatMap((id) => [
+        `${id}_Question`,
+        `${id}_StudentAnswer`,
+        `${id}_CorrectAnswer`,
+        `${id}_Verdict`,
+        `${id}_Closeness`,
+        `${id}_QuestionScore`,
+      ]),
+      "Feedback",
+      "Graded At",
+    ];
+
     const rows = students.map((s) => {
-      const total = s?.result?.total_score ?? "";
-      const perQs = questionKeys.map((k) => s?.result?.scores?.[k] ?? "");
-      const feedback = s?.result?.feedback ?? "";
-      const gradedAt = s?.gradedAt ?? "";
-      const raw = [s.name, total, ...perQs, feedback, gradedAt];
-      return raw.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(",");
+      const row = [s.name, s?.result?.total_score ?? ""];
+      questionIds.forEach((id) => {
+        const q = s?.result?.questions?.find((qq) => qq.id === id);
+        row.push(
+          q?.question ?? "",
+          q?.student_answer ?? "",
+          q?.correct_answer ?? "",
+          q?.verdict ?? "",
+          q?.closeness ?? "",
+          q?.questionscore ?? ""
+        );
+      });
+      row.push(s?.result?.feedback ?? "", s?.gradedAt ?? "");
+      return row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(",");
     });
 
     const csv = [headers.join(","), ...rows].join("\n");
@@ -386,32 +408,59 @@ export default function App() {
                 </span>
               </p>
 
-              {currentStudent.result && currentStudent.status === "displayed" && (
-                <div className="result-box">
-                  {currentStudent.result.error ? (
-                    <p className="text-error">{currentStudent.result.error}</p>
-                  ) : (
-                    <>
-                      <p>
-                        <strong>Total Score:</strong>{" "}
-                        {currentStudent.result.total_score}
-                      </p>
-                      <pre className="code-box">
-                        {JSON.stringify(currentStudent.result.scores, null, 2)}
-                      </pre>
-                      <p className="mt-2">
-                        <strong>Feedback:</strong>{" "}
-                        {currentStudent.result.feedback}
-                      </p>
-                      {currentStudent.gradedAt && (
-                        <p className="mt-2 text-sm">
-                          <strong>Graded At:</strong> {currentStudent.gradedAt}
+              {currentStudent.result &&
+                currentStudent.status === "displayed" && (
+                  <div className="result-box">
+                    {currentStudent.result.error ? (
+                      <p className="text-error">{currentStudent.result.error}</p>
+                    ) : (
+                      <>
+                        <p>
+                          <strong>Total Score:</strong>{" "}
+                          {currentStudent.result.total_score}
                         </p>
-                      )}
-                    </>
-                  )}
-                </div>
-              )}
+                        {currentStudent.result.questions?.map((q, idx) => (
+                          <div key={idx} className="mb-3 border-b pb-2">
+                            <p>
+                              <strong>
+                                Q{idx + 1}. {q.question}
+                              </strong>
+                            </p>
+                            <p>
+                              Answer: {q.student_answer} (
+                              <span
+                                style={{
+                                  color:
+                                    q.verdict === "Correct"
+                                      ? "green"
+                                      : q.verdict === "Partial"
+                                      ? "orange"
+                                      : "red",
+                                }}
+                              >
+                                {q.verdict}
+                              </span>
+                              )
+                            </p>
+                            <p>Correct: {q.correct_answer}</p>
+                            <p>Closeness: {q.closeness}%</p>
+                            <p>Question Score: {q.questionscore}</p>
+                          </div>
+                        ))}
+                        <p className="mt-2">
+                          <strong>Feedback:</strong>{" "}
+                          {currentStudent.result.feedback}
+                        </p>
+                        {currentStudent.gradedAt && (
+                          <p className="mt-2 text-sm">
+                            <strong>Graded At:</strong>{" "}
+                            {currentStudent.gradedAt}
+                          </p>
+                        )}
+                      </>
+                    )}
+                  </div>
+                )}
             </>
           )}
         </div>
