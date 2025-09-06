@@ -1,0 +1,318 @@
+// src/App.jsx
+import React, { useState } from "react";
+import JSZip from "jszip";
+import mammoth from "mammoth";
+import { GlobalWorkerOptions, getDocument } from "pdfjs-dist";
+
+// Required for pdf.js worker
+GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.worker.min.mjs`;
+
+export default function App() {
+  const [apiKey, setApiKey] = useState("");
+  const [answerKey, setAnswerKey] = useState("");
+  const [students, setStudents] = useState([]);
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [gradingResult, setGradingResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  // --------------------------
+  // File Parsing Helpers
+  // --------------------------
+
+  const readTxtFile = (file) =>
+    new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = (ev) => resolve(ev.target.result);
+      reader.readAsText(file);
+    });
+
+const readDocxFile = (file) =>
+   new Promise((resolve) => {
+     const reader = new FileReader();
+     reader.onload = async (ev) => {
+       try {
+         const result = await mammoth.extractRawText({ arrayBuffer: ev.target.result });
+         resolve(result.value);
+       } catch (err) {
+         resolve("Error reading docx: " + err.message);
+       }
+     };
+     reader.readAsArrayBuffer(file);
+   });
+
+  const readPdfFile = (file) =>
+    new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = async (ev) => {
+        const typedArray = new Uint8Array(ev.target.result);
+        const pdf = await getDocument(typedArray).promise;
+        let text = "";
+        for (let i = 1; i <= pdf.numPages; i++) {
+          const page = await pdf.getPage(i);
+          const content = await page.getTextContent();
+          text += content.items.map((s) => s.str).join(" ") + "\n";
+        }
+        resolve(text);
+      };
+      reader.readAsArrayBuffer(file);
+    });
+
+  const readImageFile = async (file) => {
+    // Use OpenAI Vision API for OCR
+    const base64 = await fileToBase64(file);
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Extract all text from this image:" },
+              { type: "image_url", image_url: { url: base64 } },
+            ],
+          },
+        ],
+      }),
+    });
+    const data = await response.json();
+    return data.choices[0].message.content;
+  };
+
+  const fileToBase64 = (file) =>
+    new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.readAsDataURL(file);
+    });
+
+  // --------------------------
+  // Upload Handlers
+  // --------------------------
+
+  const handleAnswerKeyUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    let content = "";
+    if (file.name.endsWith(".txt")) content = await readTxtFile(file);
+    else if (file.name.endsWith(".docx")) content = await readDocxFile(file);
+    else if (file.name.endsWith(".pdf")) content = await readPdfFile(file);
+    else content = "Unsupported file type";
+
+    setAnswerKey(content);
+  };
+
+  const handleStudentUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const addStudent = async (file) => {
+      let content = "";
+      if (file.name.endsWith(".txt")) content = await readTxtFile(file);
+      else if (file.name.endsWith(".docx")) content = await readDocxFile(file);
+      else if (file.name.endsWith(".pdf")) content = await readPdfFile(file);
+      else if (/\.(jpg|jpeg|png)$/i.test(file.name))
+        content = await readImageFile(file);
+      else content = "Unsupported file type";
+
+      return { name: file.name, content };
+    };
+
+    if (file.name.endsWith(".zip")) {
+      const zip = await JSZip.loadAsync(file);
+      const files = [];
+      for (const filename of Object.keys(zip.files)) {
+        if (!zip.files[filename].dir) {
+          const blob = await zip.files[filename].async("blob");
+          const extractedFile = new File([blob], filename);
+          files.push(await addStudent(extractedFile));
+        }
+      }
+      setStudents(files);
+      setCurrentIndex(0);
+    } else {
+      setStudents([await addStudent(file)]);
+    }
+  };
+
+  // --------------------------
+  // Manual Pasting
+  // --------------------------
+
+  const handlePasteStudent = () => {
+    setStudents((prev) => [
+      ...prev,
+      { name: `Pasted-${prev.length + 1}`, content: "" },
+    ]);
+    setCurrentIndex(students.length);
+  };
+
+  // --------------------------
+  // Grading
+  // --------------------------
+
+  const gradeStudent = async () => {
+    if (!apiKey || !answerKey || students.length === 0) return;
+    setLoading(true);
+
+    const student = students[currentIndex];
+    try {
+      const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are a grading assistant. Compare student answers to the key and provide structured results.",
+            },
+            {
+              role: "user",
+              content: `Key:\n${answerKey}\n\nStudent (${student.name}):\n${student.content}\n\nReturn JSON with:\n{"total_score": number, "scores": {"q1": number, ...}, "feedback": string}`,
+            },
+          ],
+          temperature: 0,
+        }),
+      });
+
+      const data = await response.json();
+      let text = data.choices[0].message.content;
+
+      try {
+        text = JSON.parse(text);
+      } catch (err) {
+        text = { error: "Could not parse GPT response", raw: text };
+      }
+
+      setGradingResult(text);
+    } catch (err) {
+      setGradingResult({ error: err.message });
+    }
+    setLoading(false);
+  };
+
+  // --------------------------
+  // UI
+  // --------------------------
+
+  return (
+    <div className="h-screen flex flex-col">
+      {/* API Key Input */}
+      <div className="p-2 bg-gray-200 flex gap-2">
+        <input
+          type="password"
+          placeholder="Enter OpenAI API Key"
+          value={apiKey}
+          onChange={(e) => setApiKey(e.target.value)}
+          className="border p-2 flex-1 rounded"
+        />
+      </div>
+
+      {/* Main Split */}
+      <div className="flex flex-1">
+        {/* Left Panel - Answer Key */}
+        <div className="w-1/2 border-r p-4 flex flex-col">
+          <h2 className="font-bold mb-2">Answer Key</h2>
+          <input type="file" onChange={handleAnswerKeyUpload} className="mb-2" />
+          <textarea
+            className="flex-1 border rounded p-2"
+            value={answerKey}
+            onChange={(e) => setAnswerKey(e.target.value)}
+          />
+        </div>
+
+        {/* Right Panel - Student Submissions */}
+        <div className="w-1/2 p-4 flex flex-col">
+          <h2 className="font-bold mb-2">Student Submissions</h2>
+          <div className="flex gap-2 mb-2">
+            <input type="file" onChange={handleStudentUpload} />
+            <button
+              onClick={handlePasteStudent}
+              className="px-3 py-1 bg-purple-600 text-white rounded"
+            >
+              Add Pasted
+            </button>
+          </div>
+          {students.length > 0 && (
+            <>
+              <div className="flex justify-between items-center mb-2">
+                <button
+                  className="px-3 py-1 bg-blue-500 text-white rounded disabled:opacity-50"
+                  onClick={() => setCurrentIndex((i) => Math.max(0, i - 1))}
+                  disabled={currentIndex === 0}
+                >
+                  Prev
+                </button>
+                <span>
+                  {currentIndex + 1} / {students.length} —{" "}
+                  {students[currentIndex].name}
+                </span>
+                <button
+                  className="px-3 py-1 bg-blue-500 text-white rounded disabled:opacity-50"
+                  onClick={() =>
+                    setCurrentIndex((i) => Math.min(students.length - 1, i + 1))
+                  }
+                  disabled={currentIndex === students.length - 1}
+                >
+                  Next
+                </button>
+              </div>
+              <textarea
+                className="flex-1 border rounded p-2"
+                value={students[currentIndex].content}
+                onChange={(e) => {
+                  const updated = [...students];
+                  updated[currentIndex].content = e.target.value;
+                  setStudents(updated);
+                }}
+              />
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Bottom Summary */}
+      <div className="p-4 border-t bg-gray-100">
+        <h2 className="font-bold mb-2">Summary</h2>
+
+        <button
+          onClick={gradeStudent}
+          disabled={!answerKey || students.length === 0 || loading}
+          className="px-4 py-2 bg-green-600 text-white rounded disabled:opacity-50"
+        >
+          {loading ? "Grading..." : "Grade Current Student"}
+        </button>
+
+        {gradingResult && (
+          <div className="border rounded bg-white shadow p-2 mt-3">
+            {gradingResult.error ? (
+              <p className="text-red-500">{gradingResult.error}</p>
+            ) : (
+              <>
+                <p>
+                  <strong>Total Score:</strong> {gradingResult.total_score}
+                </p>
+                <pre className="bg-gray-200 p-2 rounded mt-2 overflow-auto">
+                  {JSON.stringify(gradingResult.scores, null, 2)}
+                </pre>
+                <p className="mt-2">
+                  <strong>Feedback:</strong> {gradingResult.feedback}
+                </p>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
