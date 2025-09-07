@@ -1,32 +1,40 @@
-// electron-main.js
-const { app, BrowserWindow } = require("electron");
-const path = require("path");
+import { app, BrowserWindow } from "electron";
+import path from "path";
+import { fileURLToPath } from "url";
 
-function createWindow() {
-  const win = new BrowserWindow({
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+let mainWindow;
+
+const createWindow = () => {
+  mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
     webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
     },
   });
 
-  // Load your app (for dev use Vite server, for prod load build)
   if (process.env.ELECTRON_START_URL) {
-    win.loadURL(process.env.ELECTRON_START_URL);
+    // dev mode → Vite dev server
+    mainWindow.loadURL(process.env.ELECTRON_START_URL);
   } else {
-    win.loadFile(path.join(__dirname, "dist/index.html"));
+    // prod mode → built index.html
+    mainWindow.loadFile(path.join(__dirname, "dist/index.html"));
   }
-}
 
-app.whenReady().then(() => {
-  createWindow();
-
-  app.on("activate", function () {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  mainWindow.on("closed", () => {
+    mainWindow = null;
   });
+};
+
+app.whenReady().then(createWindow);
+
+app.on("window-all-closed", () => {
+  if (process.platform !== "darwin") app.quit();
 });
 
-app.on("window-all-closed", function () {
-  if (process.platform !== "darwin") app.quit();
+app.on("activate", () => {
+  if (mainWindow === null) createWindow();
 });

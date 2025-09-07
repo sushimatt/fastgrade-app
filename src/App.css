@@ -1,5 +1,11 @@
 /* src/App.css */
 
+/* Add to App.css */
+.modal-card {
+  /* ...existing styles... */
+  transition: height 0.1s;
+}
+
 /* Prompt config modal */
 .modal-overlay {
   position: fixed;

@@ -8,4 +8,8 @@ export default defineConfig({
   	react(),
   	tailwindcss()
   ],
-})
+  base: "./",   // 👈 important: ensures assets load in Electron
+});
+
+
+

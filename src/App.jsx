@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import JSZip from "jszip";
 import mammoth from "mammoth";
 import { GlobalWorkerOptions, getDocument } from "pdfjs-dist";
+import Tesseract from "tesseract.js";
 import "./App.css";
 
 GlobalWorkerOptions.workerSrc =
@@ -74,8 +75,40 @@ const readPdfFile = (file) =>
     reader.readAsArrayBuffer(file);
   });
 
+// OCR for images
+const readImageFile = (file) =>
+  new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      try {
+        const { data: { text } } = await Tesseract.recognize(ev.target.result, "eng");
+        resolve(text);
+      } catch (err) {
+        resolve("Error reading image: " + err.message);
+      }
+    };
+    reader.readAsDataURL(file);
+  });
+
+// Split text into multiple students (simple: by "Student:" or page delimiter)
+const splitStudentsFromText = (text) => {
+  // Try to split by "Student:" or "Name:" or page breaks
+  const parts = text
+    .split(/\n\s*(Student:|Name:|Page \d+|-----+)\s*\n/i)
+    .map((t) => t.trim())
+    .filter((t) => t.length > 0);
+  // If only one part, return as single student
+  if (parts.length <= 1) return [text];
+  // Otherwise, group by every other part (since split keeps delimiters)
+  let students = [];
+  for (let i = 0; i < parts.length; i += 2) {
+    students.push(parts[i] + (parts[i + 1] ? "\n" + parts[i + 1] : ""));
+  }
+  return students;
+};
+
 // -------------------- App --------------------
-export default function App() {
+function GradingApp() {
   const [apiKey, setApiKey] = useState("");
   const [answerKey, setAnswerKey] = useState("");
   const [students, setStudents] = useState([]);
@@ -83,9 +116,13 @@ export default function App() {
   const [passThreshold, setPassThreshold] = useState(70); // default 70%
 
   const [gradingPrompt, setGradingPrompt] = useState(
-  "You are a grading assistant. Compare student answers to the key and provide structured results. Extract the student's name if present. For each question, return closeness %, verdict, and per-question score. Include total_score and testworth (sum of max points)."
+  "You are a grading assistant. Compare student answers to the key and provide structured results. Extract the student's name if present. For each question, return closeness %, verdict, and per-question score. Include total_score and testworth (sum of max points). Grade each questions comparing conceptually the provided key answer to the question, and admit different verbiage and phrasing, do not discount points for change of language style, grammatical errors or spelling inconsistencies. Discount points for non completeness."
   );
   const [showPromptConfig, setShowPromptConfig] = useState(false);
+  const [modalHeight, setModalHeight] = useState(400);
+  const [dragging, setDragging] = useState(false);
+  const [dragStartY, setDragStartY] = useState(0);
+  const [startHeight, setStartHeight] = useState(400);
 
   // load saved key and prompt
   useEffect(() => {
@@ -128,9 +165,10 @@ export default function App() {
 
     const addStudent = async (f) => {
       let content = "";
-      if (f.name.endsWith(".txt")) content = await readTxtFile(f);
-      else if (f.name.endsWith(".docx")) content = await readDocxFile(f);
-      else if (f.name.endsWith(".pdf")) content = await readPdfFile(f);
+      if (f.name.match(/\.(txt)$/i)) content = await readTxtFile(f);
+      else if (f.name.match(/\.(docx)$/i)) content = await readDocxFile(f);
+      else if (f.name.match(/\.(pdf)$/i)) content = await readPdfFile(f);
+      else if (f.name.match(/\.(jpe?g|png|tiff?)$/i)) content = await readImageFile(f);
       else content = "Unsupported file type";
       return {
         name: f.name,
@@ -142,6 +180,7 @@ export default function App() {
       };
     };
 
+    // Handle ZIP as before
     if (file.name.endsWith(".zip")) {
       const zip = await JSZip.loadAsync(file);
       const files = [];
@@ -154,10 +193,32 @@ export default function App() {
       }
       setStudents(files);
       setCurrentIndex(0);
-    } else {
-      setStudents([await addStudent(file)]);
-      setCurrentIndex(0);
+      return;
     }
+
+    // For PDF and image: allow splitting into multiple students
+    if (file.name.match(/\.(pdf|jpe?g|png|tiff?)$/i)) {
+      let content = "";
+      if (file.name.match(/pdf$/i)) content = await readPdfFile(file);
+      else content = await readImageFile(file);
+
+      const studentTexts = splitStudentsFromText(content);
+      const studentObjs = studentTexts.map((text, idx) => ({
+        name: `${file.name}-Student${idx + 1}`,
+        content: text,
+        result: null,
+        status: "idle",
+        gradedAt: null,
+        elapsed: 0,
+      }));
+      setStudents(studentObjs);
+      setCurrentIndex(0);
+      return;
+    }
+
+    // Default: single student
+    setStudents([await addStudent(file)]);
+    setCurrentIndex(0);
   };
 
   const handlePasteStudent = () => {
@@ -360,12 +421,30 @@ Only return valid JSON.`,
       {/* Prompt Configuration Modal */}
       {showPromptConfig && (
         <div className="modal-overlay" onClick={() => setShowPromptConfig(false)}>
-          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+          <div
+            className="modal-card"
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              height: modalHeight,
+              minHeight: 200,
+              maxHeight: 700,
+              overflow: "auto",
+              position: "relative",
+              // width: "500px", // optionally set a width
+            }}
+          >
             <h2 className="panel-title">Edit Grading Prompt</h2>
             <textarea
               className="textarea"
               value={gradingPrompt}
               onChange={(e) => setGradingPrompt(e.target.value)}
+              style={{
+                height: modalHeight - 120,
+                overflowY: "auto",
+                resize: "none",
+                width: "100%",
+                boxSizing: "border-box",
+              }}
             />
             <div className="flex justify-end gap-2">
               <button className="btn-secondary" onClick={() => setShowPromptConfig(false)}>
@@ -381,14 +460,43 @@ Only return valid JSON.`,
                 Save
               </button>
             </div>
+            {/* Resize handle */}
+            <div
+              style={{
+                height: 12,
+                cursor: "ns-resize",
+                width: "100%",
+                position: "absolute",
+                bottom: 0,
+                left: 0,
+                background: "linear-gradient(to top, #eee, transparent)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                userSelect: "none",
+              }}
+              onMouseDown={(e) => {
+                setDragging(true);
+                setDragStartY(e.clientY);
+                setStartHeight(modalHeight);
+              }}
+            >
+              <div style={{
+                width: 40,
+                height: 4,
+                borderRadius: 2,
+                background: "#bbb",
+                margin: "4px 0",
+              }} />
+            </div>
           </div>
         </div>
       )}
 
 
-      <div className="flex flex-1">
+      <div className="flex flex-1 w-full">
         {/* Left: Students */}
-        <div className="panel w-[25%] overflow-y-auto">
+        <div className="panel flex-1 overflow-y-auto">
           <h2 className="panel-title">Student Submissions</h2>
           <div className="flex gap-2 mb-2">
             <input
@@ -443,7 +551,7 @@ Only return valid JSON.`,
         </div>
 
         {/* Middle: Answer Key */}
-        <div className="panel w-[25%] border-l border-r overflow-y-auto">
+        <div className="panel flex-1 border-l border-r overflow-y-auto">
           <h2 className="panel-title">Answer Key</h2>
           <input
             type="file"
@@ -458,7 +566,7 @@ Only return valid JSON.`,
         </div>
 
         {/* Right: Individual Evaluation */}
-        <div className="panel w-[25%] border-r overflow-y-auto">
+        <div className="panel flex-1 border-r overflow-y-auto">
           <h2 className="panel-title">Evaluation</h2>
           <div className="flex gap-2 mb-3">
             <button
@@ -566,7 +674,7 @@ Only return valid JSON.`,
         </div>
 
         {/* Rightmost Column: Scores Overview */}
-        <div className="panel w-[25%] overflow-y-auto">
+        <div className="panel flex-1 overflow-y-auto">
           <div className="flex justify-between items-center">
             <h2 className="panel-title">Scores Overview</h2>
             <button onClick={exportCSV} className="btn-primary text-sm">Export CSV</button>
@@ -631,5 +739,14 @@ Only return valid JSON.`,
         </div>
       </div>
     </div>
+  );
+}
+
+// Wrapper for local execution
+export default function AppWrapper() {
+  return (
+    <React.StrictMode>
+      <GradingApp />
+    </React.StrictMode>
   );
 }
