@@ -1,9 +1,9 @@
-name: Build Electron App
+name: Build & Release FastGrade App
 
 on:
   push:
     tags:
-      - 'v*'   # runs only when you push tags like v1.0.0
+      - 'v*'   # only run when pushing tags like v1.0.0
 
 jobs:
   release:
@@ -13,21 +13,30 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
-      - uses: actions/checkout@v3
+      # 1. Checkout repo
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v3
+      # 2. Set up Node.js
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 20
 
+      # 3. Install dependencies
       - name: Install dependencies
         run: npm install
 
+      # 4. Build app (electron-builder will detect tag and version)
       - name: Build distributables
         run: npm run dist
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}   # gives electron-builder permission to publish
 
-      - name: Upload binaries to GitHub Release
+      # 5. Upload release artifacts
+      - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v1
         with:
           files: release/**
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
