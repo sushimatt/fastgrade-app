@@ -8,6 +8,32 @@ GlobalWorkerOptions.workerSrc =
   "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.worker.min.mjs";
 
 // -------------------- Helpers --------------------
+const calculateTotals = (result) => {
+  if (!result || !result.questions) return { total: 0, worth: 0, pct: 0 };
+
+  const total = result.questions.reduce(
+    (sum, q) => sum + (parseFloat(q.questionscore) || 0),
+    0
+  );
+
+  const worth =
+    result.testworth ||
+    result.questions.reduce(
+      (sum, q) => sum + (parseFloat(q.maxscore) || 1),
+      0
+    );
+
+  const pct = worth > 0 ? (total / worth) * 100 : 0;
+
+  if (result.total_score && Math.abs(result.total_score - total) > 0.01) {
+    console.warn(
+      `⚠️ Mismatch: GPT total_score=${result.total_score}, recalculated=${total}`
+    );
+  }
+
+  return { total, worth, pct };
+};
+
 const readTxtFile = (file) =>
   new Promise((resolve) => {
     const reader = new FileReader();
@@ -52,13 +78,22 @@ const readPdfFile = (file) =>
 export default function App() {
   const [apiKey, setApiKey] = useState("");
   const [answerKey, setAnswerKey] = useState("");
-  const [students, setStudents] = useState([]); // {name, content, result, status, gradedAt, elapsed}
+  const [students, setStudents] = useState([]);
   const [currentIndex, setCurrentIndex] = useState(0);
+  const [passThreshold, setPassThreshold] = useState(70); // default 70%
 
-  // load saved key
+  const [gradingPrompt, setGradingPrompt] = useState(
+  "You are a grading assistant. Compare student answers to the key and provide structured results. Extract the student's name if present. For each question, return closeness %, verdict, and per-question score. Include total_score and testworth (sum of max points)."
+  );
+  const [showPromptConfig, setShowPromptConfig] = useState(false);
+
+  // load saved key and prompt
   useEffect(() => {
     const saved = localStorage.getItem("openai_api_key");
     if (saved) setApiKey(saved);
+
+    const savedPrompt = localStorage.getItem("grading_prompt");
+    if (savedPrompt) setGradingPrompt(savedPrompt);
   }, []);
 
   const handleApiKeyChange = (e) => {
@@ -148,7 +183,10 @@ export default function App() {
     let seconds = 0;
     const timer = setInterval(() => {
       seconds++;
-      updateStudent(index, { status: `processing (${seconds}s)`, elapsed: seconds });
+      updateStudent(index, {
+        status: `processing (${seconds}s)`,
+        elapsed: seconds,
+      });
     }, 1000);
 
     try {
@@ -161,16 +199,14 @@ export default function App() {
         body: JSON.stringify({
           model: "gpt-4o-mini",
           messages: [
-            {
-              role: "system",
-              content:
-                "You are a grading assistant. Compare student answers to the key and provide structured results. Don't get creative but do compare the answer from the key to the student's answer carefully and contextually, even if the wording is different - assign complete credit if answer answers the question conceptually, don't deduct points for spelling or if worded different. For each question, assign a closeness score (0-100) and a verdict (Correct, Partial, Incorrect) based on the closeness. The Question score should be the total score of the test divided by the number of the question except if the question itself states the points it is worth. For extracting the name, use the filename, first line of the submission or anything that has Name, Person or Student indication and chose the one that is most likely a name.",
-            },
+            { role: "system", content: gradingPrompt },
             {
               role: "user",
-              content: `Key:\n${answerKey}\n\nStudent (${student.name}):\n${student.content}\n\nReturn JSON with structure:
+              content: `Key:\n${answerKey}\n\nStudent submission:\n${student.content}\n\nReturn JSON with structure:
 {
+  "student_name": string,
   "total_score": number,
+  "testworth": number,
   "questions": [
     {"id": "q1", "question": string, "student_answer": string, "correct_answer": string, "closeness": number, "verdict": "Correct|Partial|Incorrect", "questionscore": number}
   ],
@@ -188,7 +224,6 @@ Only return valid JSON.`,
       let text = data?.choices?.[0]?.message?.content ?? "";
       console.log("📥 Raw GPT response:", text);
 
-      // strip markdown fences
       let cleaned = text.trim();
       if (cleaned.startsWith("```")) {
         cleaned = cleaned.replace(/^```[a-zA-Z]*\n?/, "");
@@ -230,58 +265,64 @@ Only return valid JSON.`,
     }
   };
 
-  // -------------------- Export CSV --------------------
   const exportCSV = () => {
-    if (students.length === 0) return;
+  if (students.length === 0) return;
 
-    // Collect all question ids across all students
-    const qIds = new Set();
-    students.forEach((s) => {
-      s?.result?.questions?.forEach((q) => qIds.add(q.id));
+  const qIds = new Set();
+  students.forEach((s) => s?.result?.questions?.forEach((q) => qIds.add(q.id)));
+  const questionIds = Array.from(qIds);
+
+  const headers = [
+    "Name",
+    "Total Score",
+    ...questionIds.flatMap((id) => [
+      `${id}_Question`,
+      `${id}_StudentAnswer`,
+      `${id}_CorrectAnswer`,
+      `${id}_Verdict`,
+      `${id}_Closeness`,
+      `${id}_QuestionScore`,
+    ]),
+    "Feedback",
+    "Graded At",
+  ];
+
+  const rows = students.map((s) => {
+    const { total } = calculateTotals(s.result || {});
+    const row = [s?.result?.student_name || s.name, total];
+    questionIds.forEach((id) => {
+      const q = s?.result?.questions?.find((qq) => qq.id === id);
+      row.push(
+        q?.question ?? "",
+        q?.student_answer ?? "",
+        q?.correct_answer ?? "",
+        q?.verdict ?? "",
+        q?.closeness ?? "",
+        q?.questionscore ?? ""
+      );
     });
-    const questionIds = Array.from(qIds);
+    row.push(s?.result?.feedback ?? "", s?.gradedAt ?? "");
+    return row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(",");
+  });
 
-    const headers = [
-      "Name",
-      "Total Score",
-      ...questionIds.flatMap((id) => [
-        `${id}_Question`,
-        `${id}_StudentAnswer`,
-        `${id}_CorrectAnswer`,
-        `${id}_Verdict`,
-        `${id}_Closeness`,
-        `${id}_QuestionScore`,
-      ]),
-      "Feedback",
-      "Graded At",
-    ];
+  const csv = [headers.join(","), ...rows].join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.setAttribute("download", "grading_results.csv");
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+};
 
-    const rows = students.map((s) => {
-      const row = [s.name, s?.result?.total_score ?? ""];
-      questionIds.forEach((id) => {
-        const q = s?.result?.questions?.find((qq) => qq.id === id);
-        row.push(
-          q?.question ?? "",
-          q?.student_answer ?? "",
-          q?.correct_answer ?? "",
-          q?.verdict ?? "",
-          q?.closeness ?? "",
-          q?.questionscore ?? ""
-        );
-      });
-      row.push(s?.result?.feedback ?? "", s?.gradedAt ?? "");
-      return row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(",");
-    });
 
-    const csv = [headers.join(","), ...rows].join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.setAttribute("download", "grading_results.csv");
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+  // -------------------- Helpers --------------------
+  const getLetterGrade = (pct) => {
+    if (pct >= 90) return "A";
+    if (pct >= 80) return "B";
+    if (pct >= 70) return "C";
+    return "F";
   };
 
   // -------------------- UI --------------------
@@ -289,8 +330,14 @@ Only return valid JSON.`,
 
   return (
     <div className="h-screen flex flex-col">
-      {/* API Key */}
+      {/* API Key + Threshold */}
       <div className="toolbar">
+        <button
+          onClick={() => setShowPromptConfig(true)}
+          className="btn-secondary"
+        >
+          Configure Prompt
+        </button>
         <input
           type="password"
           placeholder="Enter OpenAI API Key"
@@ -298,14 +345,57 @@ Only return valid JSON.`,
           onChange={handleApiKeyChange}
           className="input"
         />
+        <input
+          type="number"
+          min="0"
+          max="100"
+          value={passThreshold}
+          onChange={(e) => setPassThreshold(Number(e.target.value))}
+          className="input"
+          style={{ width: "120px" }}
+          title="Pass/Fail Threshold (%)"
+        />
+        <span>Pass threshold (%)</span>
       </div>
+      {/* Prompt Configuration Modal */}
+      {showPromptConfig && (
+        <div className="modal-overlay" onClick={() => setShowPromptConfig(false)}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <h2 className="panel-title">Edit Grading Prompt</h2>
+            <textarea
+              className="textarea"
+              value={gradingPrompt}
+              onChange={(e) => setGradingPrompt(e.target.value)}
+            />
+            <div className="flex justify-end gap-2">
+              <button className="btn-secondary" onClick={() => setShowPromptConfig(false)}>
+                Cancel
+              </button>
+              <button
+                className="btn-success"
+                onClick={() => {
+                  localStorage.setItem("grading_prompt", gradingPrompt);
+                  setShowPromptConfig(false);
+                }}
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
 
       <div className="flex flex-1">
         {/* Left: Students */}
-        <div className="panel w-[30%]">
+        <div className="panel w-[25%] overflow-y-auto">
           <h2 className="panel-title">Student Submissions</h2>
           <div className="flex gap-2 mb-2">
-            <input type="file" onChange={handleStudentUpload} className="input-file" />
+            <input
+              type="file"
+              onChange={handleStudentUpload}
+              className="input-file"
+            />
             <button onClick={handlePasteStudent} className="btn-secondary">
               Add Pasted
             </button>
@@ -326,7 +416,9 @@ Only return valid JSON.`,
                 <button
                   className="btn-primary"
                   onClick={() =>
-                    setCurrentIndex((i) => Math.min(students.length - 1, i + 1))
+                    setCurrentIndex((i) =>
+                      Math.min(students.length - 1, i + 1)
+                    )
                   }
                   disabled={currentIndex === students.length - 1}
                 >
@@ -351,9 +443,13 @@ Only return valid JSON.`,
         </div>
 
         {/* Middle: Answer Key */}
-        <div className="panel w-[30%] border-l border-r">
+        <div className="panel w-[25%] border-l border-r overflow-y-auto">
           <h2 className="panel-title">Answer Key</h2>
-          <input type="file" onChange={handleAnswerKeyUpload} className="input-file" />
+          <input
+            type="file"
+            onChange={handleAnswerKeyUpload}
+            className="input-file"
+          />
           <textarea
             className="textarea"
             value={answerKey}
@@ -361,8 +457,8 @@ Only return valid JSON.`,
           />
         </div>
 
-        {/* Right: Evaluation */}
-        <div className="panel w-[40%]">
+        {/* Right: Individual Evaluation */}
+        <div className="panel w-[25%] border-r overflow-y-auto">
           <h2 className="panel-title">Evaluation</h2>
           <div className="flex gap-2 mb-3">
             <button
@@ -378,13 +474,6 @@ Only return valid JSON.`,
               className="btn-primary"
             >
               Grade All
-            </button>
-            <button
-              onClick={exportCSV}
-              disabled={students.length === 0}
-              className="btn-secondary"
-            >
-              Export CSV
             </button>
           </div>
 
@@ -412,13 +501,30 @@ Only return valid JSON.`,
                 currentStudent.status === "displayed" && (
                   <div className="result-box">
                     {currentStudent.result.error ? (
-                      <p className="text-error">{currentStudent.result.error}</p>
+                      <p className="text-error">
+                        {currentStudent.result.error}
+                      </p>
                     ) : (
                       <>
                         <p>
-                          <strong>Total Score:</strong>{" "}
-                          {currentStudent.result.total_score}
+                          <strong>Name:</strong>{" "}
+                          {currentStudent.result.student_name ||
+                            currentStudent.name}
                         </p>
+                        {(() => {
+                          const { total, worth, pct } = calculateTotals(
+                            currentStudent.result
+                          );
+                          const pass = pct >= passThreshold;
+                          return (
+                            <p>
+                              <strong>Total Score:</strong> {total} / {worth} (
+                              {pct.toFixed(1)}%) —{" "}
+                              {pass ? "✅ Pass" : "❌ Fail"} — Grade:{" "}
+                              {getLetterGrade(pct)}
+                            </p>
+                          );
+                        })()}
                         {currentStudent.result.questions?.map((q, idx) => (
                           <div key={idx} className="mb-3 border-b pb-2">
                             <p>
@@ -451,18 +557,77 @@ Only return valid JSON.`,
                           <strong>Feedback:</strong>{" "}
                           {currentStudent.result.feedback}
                         </p>
-                        {currentStudent.gradedAt && (
-                          <p className="mt-2 text-sm">
-                            <strong>Graded At:</strong>{" "}
-                            {currentStudent.gradedAt}
-                          </p>
-                        )}
                       </>
                     )}
                   </div>
                 )}
             </>
           )}
+        </div>
+
+        {/* Rightmost Column: Scores Overview */}
+        <div className="panel w-[25%] overflow-y-auto">
+          <div className="flex justify-between items-center">
+            <h2 className="panel-title">Scores Overview</h2>
+            <button onClick={exportCSV} className="btn-primary text-sm">Export CSV</button>
+          </div>
+
+          <table className="w-full text-sm border-collapse">
+            <thead className="sticky top-0 bg-white shadow">
+              <tr>
+                <th className="border px-2 py-1">Name</th>
+                {students[0]?.result?.questions?.map((q) => (
+                  <th key={q.id} className="border px-2 py-1">
+                    {q.id}
+                  </th>
+                ))}
+                <th className="border px-2 py-1">Final</th>
+                <th className="border px-2 py-1">%</th>
+                <th className="border px-2 py-1">✔/✘</th>
+                <th className="border px-2 py-1">Grade</th>
+              </tr>
+            </thead>
+            <tbody>
+              {students.map(
+                (s, idx) =>
+                  s.result && (
+                    <tr key={idx}>
+                      <td
+                        className="border px-2 py-1 cursor-pointer text-blue-600 underline"
+                        onClick={() => setCurrentIndex(idx)}
+                      >
+                        {s.result.student_name || s.name}
+                      </td>
+                      {s.result.questions?.map((q, i) => (
+                        <td key={i} className="border px-2 py-1 text-center">
+                          {q.questionscore}
+                        </td>
+                      ))}
+                      {(() => {
+                        const { total, worth, pct } = calculateTotals(s.result);
+                        const pass = pct >= passThreshold;
+                        return (
+                          <>
+                            <td className="border px-2 py-1 text-center font-bold">
+                              {total}
+                            </td>
+                            <td className="border px-2 py-1 text-center">
+                              {pct.toFixed(1)}%
+                            </td>
+                            <td className="border px-2 py-1 text-center">
+                              {pass ? "✅" : "❌"}
+                            </td>
+                            <td className="border px-2 py-1 text-center">
+                              {getLetterGrade(pct)}
+                            </td>
+                          </>
+                        );
+                      })()}
+                    </tr>
+                  )
+              )}
+            </tbody>
+          </table>
         </div>
       </div>
     </div>
