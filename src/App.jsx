@@ -108,7 +108,7 @@ const splitStudentsFromText = (text) => {
 };
 
 // -------------------- App --------------------
-function GradingApp() {
+export default function App() {
   const [apiKey, setApiKey] = useState("");
   const [answerKey, setAnswerKey] = useState("");
   const [students, setStudents] = useState([]);
@@ -739,14 +739,5 @@ Only return valid JSON.`,
         </div>
       </div>
     </div>
-  );
-}
-
-// Wrapper for local execution
-export default function AppWrapper() {
-  return (
-    <React.StrictMode>
-      <GradingApp />
-    </React.StrictMode>
   );
 }
